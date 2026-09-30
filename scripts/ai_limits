@@ -163,15 +163,15 @@ def bar(usage_frac, elapsed_frac, width=22):
     return "".join(chars)
 
 def top(title):
-    print(f"{CYAN}┌{'─' * INNER}┐{RESET}")
+    print(f"{CYAN}┌{'─' * (INNER + 1)}┐{RESET}")
     print(f"{CYAN}│{RESET} {BOLD}{WHITE}{pad(title)}{RESET}{CYAN}│{RESET}")
-    print(f"{CYAN}├{'─' * INNER}┤{RESET}")
+    print(f"{CYAN}├{'─' * (INNER + 1)}┤{RESET}")
 
 def row(content):
     print(f"{CYAN}│{RESET} {pad(content)}{CYAN}│{RESET}")
 
 def bottom():
-    print(f"{CYAN}└{'─' * INNER}┘{RESET}")
+    print(f"{CYAN}└{'─' * (INNER + 1)}┘{RESET}")
 
 now = datetime.now().astimezone()
 print()
