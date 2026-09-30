@@ -1,92 +1,3 @@
-#!/bin/bash
-# ai_limits — Claude usage dashboard
-# Cyberpunk terminal UI
-
-set -uo pipefail
-trap 'printf "\r\033[K\n"; exit 130' INT
-
-REFRESH_MINS="${1:-}"
-
-while true; do
-
-# ── Claude credentials ───────────────────────────────────────
-CREDS=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || {
-    echo "Error: Could not read Claude credentials from keychain" >&2
-    exit 1
-}
-
-TOKEN_INFO=$(python3 -c "
-import sys, json
-d = json.loads('''$CREDS''')['claudeAiOauth']
-scopes = d.get('scopes') or ['user:profile', 'user:inference', 'user:sessions:claude_code', 'user:mcp_servers', 'user:file_upload']
-print(d.get('accessToken', ''))
-print(d.get('refreshToken', ''))
-print(d.get('expiresAt', 0))
-print(' '.join(scopes))
-") || {
-    echo "Error: Could not parse OAuth token" >&2
-    exit 1
-}
-TOKEN=$(sed -n '1p' <<< "$TOKEN_INFO")
-CLAUDE_REFRESH_TOKEN=$(sed -n '2p' <<< "$TOKEN_INFO")
-CLAUDE_EXPIRES_AT=$(sed -n '3p' <<< "$TOKEN_INFO")
-CLAUDE_SCOPES=$(sed -n '4p' <<< "$TOKEN_INFO")
-
-CLAUDE_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-
-refresh_claude_token() {
-    [[ -z "$CLAUDE_REFRESH_TOKEN" ]] && return 1
-    local resp new_token
-    resp=$(python3 -c "
-import json
-print(json.dumps({
-    'grant_type': 'refresh_token',
-    'refresh_token': '''$CLAUDE_REFRESH_TOKEN''',
-    'client_id': '$CLAUDE_CLIENT_ID',
-    'scope': '''$CLAUDE_SCOPES''',
-}))" | curl -sf -X POST \
-        -H "Content-Type: application/json" \
-        --data-binary @- \
-        "https://platform.claude.com/v1/oauth/token") || return 1
-    new_token=$(python3 -c "
-import json
-try:
-    print(json.loads('''$resp''').get('access_token', ''))
-except Exception:
-    pass
-")
-    [[ -z "$new_token" ]] && return 1
-    TOKEN="$new_token"
-    return 0
-}
-
-NOW_MS=$(($(date +%s) * 1000))
-if [[ -n "$CLAUDE_EXPIRES_AT" && "$CLAUDE_EXPIRES_AT" -gt 0 && $((CLAUDE_EXPIRES_AT - NOW_MS)) -lt 60000 ]]; then
-    refresh_claude_token || true
-fi
-
-# ── Claude usage API ─────────────────────────────────────────
-CLAUDE_API_ERROR=0
-call_claude_usage() {
-    curl -sf \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "anthropic-beta: oauth-2025-04-20" \
-        -H "User-Agent: claude-code/$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" \
-        "https://api.anthropic.com/api/oauth/usage"
-}
-
-RESPONSE=$(call_claude_usage) || {
-    if refresh_claude_token && RESPONSE=$(call_claude_usage); then
-        :
-    else
-        echo "Warning: Claude API request failed" >&2
-        RESPONSE='{}'
-        CLAUDE_API_ERROR=1
-    fi
-}
-
-# ── Display ──────────────────────────────────────────────────
-clear
 python3 << PYEOF
 import json, sys, re, signal
 from datetime import datetime, timezone
@@ -95,7 +6,6 @@ signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 data = json.loads('''$RESPONSE''')
 claude_api_error = $CLAUDE_API_ERROR
 
-# ── palette ──────────────────────────────────────────────────
 RESET  = "\033[0m"
 DIM    = "\033[2m"
 BOLD   = "\033[1m"
@@ -106,18 +16,36 @@ RED    = "\033[38;5;196m"
 WHITE  = "\033[38;5;255m"
 GRAY   = "\033[38;5;245m"
 
-INNER = 56   # visible characters inside the box
+INNER = 60  # visible chars inside the box
 
 def visible_len(s):
     return len(re.sub(r'\033\[[0-9;]*m', '', s))
 
 def pad(s, width=INNER):
-    """Pad or truncate to exact visible width."""
+    """Force exact visible width. Truncate if needed."""
+    # strip to visible, then rebuild with ANSI preserved as much as possible
     vis = visible_len(s)
-    if vis > width:
-        # crude truncate (keeps ANSI intact enough for our use)
+    if vis == width:
         return s
-    return s + " " * (width - vis)
+    if vis < width:
+        return s + (" " * (width - vis))
+    # truncate: walk characters, skip ANSI, stop at width
+    out = []
+    count = 0
+    i = 0
+    while i < len(s) and count < width:
+        if s[i] == "\033":
+            # copy whole escape sequence
+            j = i
+            while j < len(s) and s[j] != "m":
+                j += 1
+            out.append(s[i:j+1])
+            i = j + 1
+        else:
+            out.append(s[i])
+            count += 1
+            i += 1
+    return "".join(out) + RESET
 
 def fmt_duration(secs):
     d = secs // 86400
@@ -139,7 +67,7 @@ def traffic_light(time_frac, usage_frac):
     elif diff >= -0.1: return f"{YELLOW}●{RESET}"
     else: return f"{RED}●{RESET}"
 
-def bar(usage_frac, elapsed_frac, width=24):
+def bar(usage_frac, elapsed_frac, width=22):
     usage_pos   = min(int(usage_frac   * width), width)
     elapsed_pos = min(int(elapsed_frac * width), width)
     chars = []
@@ -163,14 +91,13 @@ def row(content):
 def bottom():
     print(f"{CYAN}└{'─' * INNER}┘{RESET}")
 
-# ── header ───────────────────────────────────────────────────
+# header
 now = datetime.now().astimezone()
 print()
 print(f"  {CYAN}{BOLD}AI_LIMITS{RESET}  {DIM}// usage dashboard{RESET}")
 print(f"  {GRAY}{now.strftime('%Y-%m-%d  %H:%M:%S %Z')}{RESET}")
 print()
 
-# ── Claude panel ─────────────────────────────────────────────
 top("CLAUDE")
 
 if claude_api_error:
@@ -196,7 +123,7 @@ else:
             reset_str = "resetting soon"
             time_frac = 0.0
         else:
-            reset_str = f"resets {fmt_abs(resets_at)} · in {fmt_duration(secs_left)}"
+            reset_str = f"resets {fmt_abs(resets_at)} · {fmt_duration(secs_left)}"
             time_frac = secs_left / window_secs
 
         usage_frac   = pct / 100
@@ -207,7 +134,7 @@ else:
         row("")
         row(f"{light}  {BOLD}{label}{RESET}")
         row(f"   {CYAN}{b}{RESET}  {WHITE}{pct:5.1f}%{RESET} used")
-        row(f"   {GRAY}{elapsed_frac*100:5.1f}% time elapsed · {reset_str}{RESET}")
+        row(f"   {GRAY}{elapsed_frac*100:4.1f}% elapsed · {reset_str}{RESET}")
 
     extra = data.get("extra_usage", {})
     if extra and extra.get("is_enabled") and extra.get("utilization") is not None:
@@ -220,9 +147,4 @@ bottom()
 print()
 print(f"  {DIM}● green = on pace   ● yellow = close   ● red = over pace{RESET}")
 print()
-
 PYEOF
-
-[[ -z "$REFRESH_MINS" ]] && break
-sleep $(( REFRESH_MINS * 60 ))
-done
