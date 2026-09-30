@@ -1,25 +1,11 @@
 #!/bin/bash
-# ai_limits — Claude + GitHub Actions usage dashboard
+# ai_limits — Claude usage dashboard
 # Cyberpunk terminal UI
 
 set -uo pipefail
 trap 'printf "\r\033[K\n"; exit 130' INT
 
 REFRESH_MINS="${1:-}"
-GITHUB_ORG="${GITHUB_ORG:-}"
-
-# ── ANSI palette ──────────────────────────────────────────────
-C_RESET='\033[0m'
-C_DIM='\033[2m'
-C_BOLD='\033[1m'
-C_CYAN='\033[38;5;51m'
-C_MAGENTA='\033[38;5;201m'
-C_GREEN='\033[38;5;46m'
-C_YELLOW='\033[38;5;226m'
-C_RED='\033[38;5;196m'
-C_WHITE='\033[38;5;255m'
-C_GRAY='\033[38;5;245m'
-C_BG='\033[48;5;232m'
 
 while true; do
 
@@ -99,74 +85,39 @@ RESPONSE=$(call_claude_usage) || {
     fi
 }
 
-# ── GitHub Actions billing ───────────────────────────────────
-get_gh_actions_billing() {
-    local year month data
-    year=$(date +%Y)
-    month=$(date +%-m)
-
-    data=$(gh api --paginate "/orgs/${GITHUB_ORG}/settings/billing/usage?year=${year}&month=${month}" \
-        --jq '.usageItems[]?' 2>/dev/null) || {
-        # fallback for user accounts
-        data=$(gh api --paginate "/users/${GITHUB_ORG}/settings/billing/usage?year=${year}&month=${month}" \
-            --jq '.usageItems[]?' 2>/dev/null) || {
-            echo '{"total_minutes_used":0,"included_minutes":2000,"minutes_used_breakdown":{}}'
-            return
-        }
-    }
-
-    echo "$data" | python3 -c "
-import json, sys
-MULTIPLIERS = {'UBUNTU': 1, 'WINDOWS': 2, 'MACOS': 10}
-raw = {}
-billed = 0.0
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    item = json.loads(line)
-    if item.get('product') != 'actions': continue
-    qty = item.get('quantity', 0)
-    sku = item.get('sku', '').lower()
-    if 'linux' in sku: key = 'UBUNTU'
-    elif 'mac' in sku: key = 'MACOS'
-    elif 'windows' in sku: key = 'WINDOWS'
-    else: key = item.get('sku', 'Other')
-    raw[key] = raw.get(key, 0.0) + qty
-    billed += qty * MULTIPLIERS.get(key, 1)
-print(json.dumps({'total_minutes_used': billed, 'included_minutes': 2000, 'minutes_used_breakdown': raw}))
-"
-}
-
-printf "Fetching usage data..." >&2
-GH_BILLING=$(get_gh_actions_billing)
-GH_BILLING=${GH_BILLING:-'{"total_minutes_used":0,"included_minutes":2000,"minutes_used_breakdown":{}}'}
-printf "\r\033[K" >&2
-
 # ── Display ──────────────────────────────────────────────────
 clear
 python3 << PYEOF
-import json, sys, math, signal
+import json, sys, re, signal
 from datetime import datetime, timezone
 signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 
 data = json.loads('''$RESPONSE''')
 claude_api_error = $CLAUDE_API_ERROR
-gh_billing     = json.loads('''$GH_BILLING''')
-gh_total_mins  = gh_billing.get('total_minutes_used', 0)
-gh_allowance   = gh_billing.get('included_minutes', 2000)
-gh_breakdown   = gh_billing.get('minutes_used_breakdown', {})
 
-# ── helpers ──────────────────────────────────────────────────
+# ── palette ──────────────────────────────────────────────────
 RESET  = "\033[0m"
 DIM    = "\033[2m"
 BOLD   = "\033[1m"
 CYAN   = "\033[38;5;51m"
-MAGENTA= "\033[38;5;201m"
 GREEN  = "\033[38;5;46m"
 YELLOW = "\033[38;5;226m"
 RED    = "\033[38;5;196m"
 WHITE  = "\033[38;5;255m"
 GRAY   = "\033[38;5;245m"
+
+INNER = 56   # visible characters inside the box
+
+def visible_len(s):
+    return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+def pad(s, width=INNER):
+    """Pad or truncate to exact visible width."""
+    vis = visible_len(s)
+    if vis > width:
+        # crude truncate (keeps ANSI intact enough for our use)
+        return s
+    return s + " " * (width - vis)
 
 def fmt_duration(secs):
     d = secs // 86400
@@ -188,33 +139,29 @@ def traffic_light(time_frac, usage_frac):
     elif diff >= -0.1: return f"{YELLOW}●{RESET}"
     else: return f"{RED}●{RESET}"
 
-def bar(usage_frac, elapsed_frac, width=28):
+def bar(usage_frac, elapsed_frac, width=24):
     usage_pos   = min(int(usage_frac   * width), width)
     elapsed_pos = min(int(elapsed_frac * width), width)
     chars = []
     for i in range(width):
         top = i < usage_pos
         bot = i < elapsed_pos
-        if top and bot:   chars.append('█')
-        elif top:         chars.append('▀')
-        elif bot:         chars.append('▄')
-        else:             chars.append('·')
+        if top and bot:   chars.append("█")
+        elif top:         chars.append("▀")
+        elif bot:         chars.append("▄")
+        else:             chars.append("·")
     return "".join(chars)
 
-def panel_header(title):
-    w = 62
-    print(f"{CYAN}┌{'─' * w}┐{RESET}")
-    print(f"{CYAN}│{RESET}  {BOLD}{WHITE}{title:<{w-2}}{RESET}{CYAN}│{RESET}")
-    print(f"{CYAN}├{'─' * w}┤{RESET}")
+def top(title):
+    print(f"{CYAN}┌{'─' * INNER}┐{RESET}")
+    print(f"{CYAN}│{RESET} {BOLD}{WHITE}{pad(title)}{RESET}{CYAN}│{RESET}")
+    print(f"{CYAN}├{'─' * INNER}┤{RESET}")
 
-def panel_footer():
-    print(f"{CYAN}└{'─' * 62}┘{RESET}")
+def row(content):
+    print(f"{CYAN}│{RESET} {pad(content)}{CYAN}│{RESET}")
 
-def panel_row(content):
-    print(f"{CYAN}│{RESET}  {content}{CYAN}│{RESET}")
-
-def empty_row():
-    print(f"{CYAN}│{' ' * 62}│{RESET}")
+def bottom():
+    print(f"{CYAN}└{'─' * INNER}┘{RESET}")
 
 # ── header ───────────────────────────────────────────────────
 now = datetime.now().astimezone()
@@ -224,23 +171,24 @@ print(f"  {GRAY}{now.strftime('%Y-%m-%d  %H:%M:%S %Z')}{RESET}")
 print()
 
 # ── Claude panel ─────────────────────────────────────────────
-panel_header("CLAUDE")
+top("CLAUDE")
+
 if claude_api_error:
-    empty_row()
-    panel_row(f"{RED}API request failed — check token or network{RESET}")
-    empty_row()
+    row("")
+    row(f"{RED}API request failed — check token or network{RESET}")
+    row("")
 else:
     for label, key, window_secs in [
         ("5-HOUR WINDOW", "five_hour", 5 * 3600),
         ("7-DAY WINDOW",  "seven_day", 7 * 24 * 3600),
     ]:
         d = data.get(key)
-        if not d or d.get('utilization') is None:
+        if not d or d.get("utilization") is None:
             continue
-        pct = d['utilization']
-        if not isinstance(d.get('resets_at'), str):
+        pct = d["utilization"]
+        if not isinstance(d.get("resets_at"), str):
             continue
-        resets_at = datetime.fromisoformat(d['resets_at'])
+        resets_at = datetime.fromisoformat(d["resets_at"])
         now_utc = datetime.now(timezone.utc)
         secs_left = int((resets_at - now_utc).total_seconds())
 
@@ -248,7 +196,7 @@ else:
             reset_str = "resetting soon"
             time_frac = 0.0
         else:
-            reset_str = f"resets {fmt_abs(resets_at)}  ·  in {fmt_duration(secs_left)}"
+            reset_str = f"resets {fmt_abs(resets_at)} · in {fmt_duration(secs_left)}"
             time_frac = secs_left / window_secs
 
         usage_frac   = pct / 100
@@ -256,57 +204,20 @@ else:
         light        = traffic_light(time_frac, usage_frac)
         b            = bar(usage_frac, elapsed_frac)
 
-        empty_row()
-        panel_row(f"{light}  {BOLD}{label}{RESET}")
-        panel_row(f"    {CYAN}{b}{RESET}  {WHITE}{pct:5.1f}%{RESET} used")
-        panel_row(f"    {GRAY}{elapsed_frac*100:5.1f}% time elapsed · {reset_str}{RESET}")
+        row("")
+        row(f"{light}  {BOLD}{label}{RESET}")
+        row(f"   {CYAN}{b}{RESET}  {WHITE}{pct:5.1f}%{RESET} used")
+        row(f"   {GRAY}{elapsed_frac*100:5.1f}% time elapsed · {reset_str}{RESET}")
 
     extra = data.get("extra_usage", {})
     if extra and extra.get("is_enabled") and extra.get("utilization") is not None:
-        empty_row()
-        panel_row(f"{GRAY}Extra usage: {extra['utilization']:.0f}% of monthly add-on{RESET}")
+        row("")
+        row(f"{GRAY}Extra usage: {extra['utilization']:.0f}% of monthly add-on{RESET}")
 
-    empty_row()
-panel_footer()
+    row("")
+
+bottom()
 print()
-
-# ── GitHub Actions panel ─────────────────────────────────────
-panel_header("GITHUB ACTIONS")
-
-now_utc = datetime.now(timezone.utc)
-month_start = datetime(now_utc.year, now_utc.month, 1, tzinfo=timezone.utc)
-if now_utc.month == 12:
-    month_end = datetime(now_utc.year + 1, 1, 1, tzinfo=timezone.utc)
-else:
-    month_end = datetime(now_utc.year, now_utc.month + 1, 1, tzinfo=timezone.utc)
-
-month_secs     = (month_end - month_start).total_seconds()
-elapsed_secs   = (now_utc - month_start).total_seconds()
-remaining_secs = (month_end - now_utc).total_seconds()
-elapsed_frac   = elapsed_secs / month_secs
-time_frac      = remaining_secs / month_secs
-usage_frac     = gh_total_mins / gh_allowance if gh_allowance else 0
-
-light = traffic_light(time_frac, usage_frac)
-b     = bar(usage_frac, elapsed_frac)
-reset_str = f"resets {month_end.astimezone().strftime('%b %d')}  ·  in {fmt_duration(int(remaining_secs))}"
-
-empty_row()
-panel_row(f"{light}  {BOLD}MONTHLY MINUTES{RESET}")
-panel_row(f"    {CYAN}{b}{RESET}  {WHITE}{gh_total_mins:.1f} / {gh_allowance}{RESET} min")
-panel_row(f"    {GRAY}{elapsed_frac*100:.0f}% of month elapsed · {reset_str}{RESET}")
-
-MULT = {'Ubuntu': 1, 'Windows': 2, 'Macos': 10}
-breakdown = [f"{k}: {v:.1f}" for k, v in gh_breakdown.items() if v]
-if breakdown:
-    empty_row()
-    panel_row(f"{GRAY}Breakdown: {',  '.join(breakdown)}{RESET}")
-
-empty_row()
-panel_footer()
-print()
-
-# ── footer ───────────────────────────────────────────────────
 print(f"  {DIM}● green = on pace   ● yellow = close   ● red = over pace{RESET}")
 print()
 
